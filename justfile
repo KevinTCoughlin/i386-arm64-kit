@@ -9,7 +9,7 @@ default:
 
 # shellcheck every script, hadolint the example
 lint:
-    shellcheck --enable=all -x image/i386-compat.sh image/install-steamcmd.sh probe.sh macos/container-launchd macos/example.conf
+    shellcheck --enable=all -x -P SCRIPTDIR image/i386-compat.sh image/install-steamcmd.sh probe.sh macos/container-launchd macos/example.conf
     container run --rm -i {{HADOLINT_IMAGE}} hadolint - < examples/Containerfile
 
 # Build the example for linux/arm64 and run the i386 smoke test

@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: shellcheck
         run: |
-          shellcheck --enable=all -x image/i386-compat.sh image/install-steamcmd.sh \
+          shellcheck --enable=all -x -P SCRIPTDIR image/i386-compat.sh image/install-steamcmd.sh \
             probe.sh macos/container-launchd macos/example.conf
       - uses: hadolint/hadolint-action@v3.5.0
         with:
