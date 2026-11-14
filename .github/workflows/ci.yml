@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: shellcheck
+        run: |
+          shellcheck --enable=all -x image/i386-compat.sh image/install-steamcmd.sh \
+            probe.sh macos/container-launchd macos/example.conf
+      - uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: examples/Containerfile
+
+  # Same Containerfile on both architectures: native i386 on amd64,
+  # qemu-i386 user-mode emulation on arm64 (what Apple silicon runs).
+  smoke-test:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    name: smoke-test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build example image
+        run: docker build --platform linux/${{ matrix.arch }} -t i386-kit-example:test -f examples/Containerfile .
+      - name: Run i386 hello under the image
+        run: docker run --rm i386-kit-example:test
+      - name: SteamCMD starts
+        # Like the image build: SteamCMD may exit 1 once right after self-updating.
+        run: docker run --rm i386-kit-example:test bash -c 'steamcmd +quit || steamcmd +quit'
