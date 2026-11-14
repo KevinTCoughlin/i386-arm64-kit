@@ -252,13 +252,20 @@ trixie (qemu 10.0):
 - `--i386-pkg`, `$I386_EXTRA_PACKAGES` and `--launcher` in a plain
   `debian:trixie-slim` container; build tools purged afterwards.
 - `probe.sh` on arm64, amd64 and i386-payload images.
+- The amd64 path of `i386-compat.sh` (multiarch `:i386` libs, plain-exec
+  `run-i386`): CI builds the example on `ubuntu-latest` and runs the i386
+  smoke test and SteamCMD. **Docker caveat on x86_64 Linux hosts:** Docker
+  29's default seccomp profile answers 32-bit `socket()` with `ENOSYS`, so
+  native i386 code gets no network at all (SteamCMD: "needs to be online to
+  update"; curl: "Could not resolve host"). Run such containers with
+  `--security-opt seccomp=unconfined` (or a profile that allows the i386
+  socket syscalls), and build with buildx's `docker-container` driver.
+  Apple silicon is unaffected: qemu-i386 issues 64-bit syscalls.
 - `container-launchd serve` (ports, env, named volume + `VOLUME_OWNER`) and
   plist rendering (`plutil -lint`, paths with `&#<>`) under bash 3.2 and 5.
 
 Not verified:
 
-- the amd64 path of `i386-compat.sh` (multiarch `:i386` libs, plain-exec
-  `run-i386`/launchers): logic only, no x86 host to run it on;
 - `container-launchd install`/`stop`/`restart`/`uninstall` against a live
   launchd (the same flow as cs-server's `ops/cs-server`, which is in use);
 - Ubuntu bases (arm64 needs extra apt sources for i386) and zstd layers;
