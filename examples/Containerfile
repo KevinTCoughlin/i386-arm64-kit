@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Kevin T. Coughlin
+#
+# Minimal SteamCMD-based game server image that builds for linux/amd64 and
+# linux/arm64 (Apple silicon) from the same file. Build from the kit root:
+#
+#   container build --platform linux/arm64 -t steam-example -f examples/Containerfile .
+#   container run --rm steam-example                 # i386 smoke test
+#
+# To fetch a real dedicated server, pass its Steam app id and point a
+# launcher at its 32-bit binary (64-bit servers: see README, "SteamCMD"):
+#
+#   --build-arg STEAM_APP_ID=90 ...  plus  --launcher hlds_linux=/srv/game/hlds_linux
+
+# A tiny i386 program to prove the toolchain end to end. Your image won't
+# need this stage: its i386 binaries come from SteamCMD.
+FROM debian:trixie-slim AS hello
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc-i686-linux-gnu libc6-dev-i386-cross \
+    && rm -rf /var/lib/apt/lists/*
+COPY examples/hello.c /src/hello.c
+RUN i686-linux-gnu-gcc -O2 -Wall -o /hello-i386 /src/hello.c
+
+FROM debian:trixie-slim
+
+# Empty: just install SteamCMD (still proves it runs under emulation).
+ARG STEAM_APP_ID=""
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# i386 runtime libs for this architecture, run-i386, and on arm64 a static
+# qemu-i386 + the Steam shim. Each --launcher becomes /usr/local/bin/NAME.
+# Bind-mounting the kit keeps its sources out of the image.
+RUN --mount=type=bind,source=image,target=/usr/local/src/i386-kit \
+    bash /usr/local/src/i386-kit/i386-compat.sh install \
+        --launcher hello-i386=/opt/hello/hello-i386 \
+        curl procps
+
+COPY --from=hello /hello-i386 /opt/hello/hello-i386
+
+# SteamCMD in /opt/steamcmd plus a /usr/local/bin/steamcmd wrapper that sets
+# DEBUGGER=run-i386 STEAM_PLATFORM=linux32.
+RUN --mount=type=bind,source=image,target=/usr/local/src/i386-kit \
+    bash /usr/local/src/i386-kit/install-steamcmd.sh /opt/steamcmd \
+    && useradd --uid 1000 --create-home --shell /usr/sbin/nologin steam \
+    && install -d -o steam -g steam /srv/game \
+    && chown -R steam:steam /opt/steamcmd
+
+USER 1000:1000
+WORKDIR /home/steam
+
+# First run self-updates SteamCMD into the image layer (and may exit 1 right
+# after updating), then optionally fetch the server.
+RUN (steamcmd +quit || steamcmd +quit) \
+    && if [[ -n "${STEAM_APP_ID}" ]]; then \
+        steamcmd +force_install_dir /srv/game +login anonymous \
+            +app_update "${STEAM_APP_ID}" validate +quit; \
+    fi
+
+# For a real server: CMD ["hlds_linux", "-game", "cstrike", ...] and
+# HEALTHCHECK CMD pgrep -x hlds_linux (the launcher keeps that comm on arm64).
+CMD ["hello-i386"]
