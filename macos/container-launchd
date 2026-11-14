@@ -1,0 +1,289 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Kevin T. Coughlin
+#
+# container-launchd — run one Apple `container` service as a macOS launchd
+# agent: started at login, restarted if it crashes, left alone if you stop it.
+#
+#   container-launchd CONFIG install     build image if missing (BUILD_CONTEXT),
+#                                        install + start the agent
+#   container-launchd CONFIG build       (re)build the image from BUILD_CONTEXT
+#   container-launchd CONFIG status      agent, container and image state
+#   container-launchd CONFIG logs [-f]   tail the service log
+#   container-launchd CONFIG restart     graceful stop, then start again
+#   container-launchd CONFIG stop        graceful stop and unload the agent
+#   container-launchd CONFIG start       load the agent again after `stop`
+#   container-launchd CONFIG uninstall [--image]
+#                                        remove agent and container (and image)
+#   container-launchd CONFIG plist       print the rendered launchd plist
+#   container-launchd CONFIG serve       foreground run; what launchd executes
+#
+# CONFIG is a path to a config file, or NAME for
+# ~/.config/container-launchd/NAME.conf. See example.conf for every setting.
+#
+# The agent has KeepAlive { SuccessfulExit = false }: launchd restarts
+# `serve` only on a non-zero exit (crash, killed VM), so a graceful stop
+# (`container stop`, exit 0) stays stopped.
+# Predicates (is_running, image_exists) are meant to be used in conditions.
+# shellcheck disable=SC2310
+set -euo pipefail
+# Runs under macOS /bin/bash 3.2 (launchd) and newer bash alike: empty arrays
+# are expanded as ${a[@]+"${a[@]}"} (3.2 + set -u), and & in ${x//p/r} is
+# literal (bash 5.2 would otherwise substitute the match).
+shopt -u patsub_replacement 2>/dev/null || true
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+TEMPLATE="${SCRIPT_PATH%/*}/container-launchd.plist.in"
+CONF_DIR="${HOME}/.config/container-launchd"
+LA_DIR="${CONTAINER_LAUNCHD_AGENTS_DIR:-${HOME}/Library/LaunchAgents}"
+GUI="gui/$(id -u)"
+
+log() {
+    local ts
+    ts=$(date '+%Y-%m-%dT%H:%M:%S%z')
+    printf '%s %s\n' "${ts}" "$*"
+}
+die() {
+    echo "container-launchd: $*" >&2
+    exit 1
+}
+usage() {
+    sed -n '5,27p' "${SCRIPT_PATH}" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+}
+
+# --- config ----------------------------------------------------------------
+
+load_config() {
+    local ref="$1"
+    if [[ "${ref}" == */* || -f "${ref}" ]]; then
+        local dir="."
+        [[ "${ref}" == */* ]] && dir="${ref%/*}"
+        dir=$(cd "${dir:-/}" && pwd)
+        CONFIG="${dir%/}/${ref##*/}"
+    else
+        CONFIG="${CONF_DIR}/${ref}.conf"
+    fi
+    [[ -f "${CONFIG}" ]] || die "config not found: ${CONFIG}"
+
+    # Defaults; the config file overrides any of them.
+    NAME=""
+    IMAGE=""
+    PORTS=()
+    MOUNTS=()
+    ENV=()
+    ENV_FILE=""
+    MEMORY="1G"
+    CPUS="2"
+    STOP_TIMEOUT=30
+    RUN_ARGS=()
+    CMD=()
+    VOLUME_OWNER=""
+    BUILD_CONTEXT=""
+    CONTAINERFILE="Containerfile"
+    PLATFORM="linux/arm64"
+    LABEL=""
+    LOG_DIR="${HOME}/Library/Logs/container-launchd"
+
+    # shellcheck source=example.conf
+    source "${CONFIG}"
+
+    [[ -n "${NAME}" ]] || die "${CONFIG}: NAME is required"
+    [[ -n "${IMAGE}" ]] || die "${CONFIG}: IMAGE is required"
+    [[ "${NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "${CONFIG}: invalid NAME '${NAME}'"
+    [[ "${STOP_TIMEOUT}" =~ ^[0-9]+$ ]] || die "${CONFIG}: STOP_TIMEOUT must be seconds"
+    LABEL="${LABEL:-local.container-launchd.${NAME}}"
+    LOG="${LOG_DIR}/${NAME}.log"
+    PLIST="${LA_DIR}/${LABEL}.plist"
+}
+
+# --- runtime ---------------------------------------------------------------
+
+ensure_runtime() {
+    command -v container >/dev/null 2>&1 || die "Apple 'container' not found (brew install container)"
+    if ! container system status >/dev/null 2>&1; then
+        log "starting container system"
+        container system start >/dev/null 2>&1 || container system start --enable-kernel-install
+    fi
+}
+
+is_running() {
+    container list 2>/dev/null | awk -v n="${NAME}" '$1==n && /running/ {f=1} END {exit !f}'
+}
+
+image_exists() { container image inspect "${IMAGE}" >/dev/null 2>&1; }
+
+build_image() {
+    [[ -n "${BUILD_CONTEXT}" ]] || die "image ${IMAGE} missing and no BUILD_CONTEXT set to build it"
+    ensure_runtime
+    log "building ${IMAGE} (${PLATFORM}) from ${BUILD_CONTEXT}"
+    (cd "${BUILD_CONTEXT}" && container build --platform "${PLATFORM}" -t "${IMAGE}" -f "${CONTAINERFILE}" .)
+}
+
+# Apple `container` named volumes start as a fresh root-owned ext4 with
+# lost+found at the top; images that run as non-root can't write to them.
+# With VOLUME_OWNER=uid:gid, chown the top of each named-volume mount first.
+chown_volumes() {
+    [[ -n "${VOLUME_OWNER}" ]] || return 0
+    local m src dst
+    for m in ${MOUNTS[@]+"${MOUNTS[@]}"}; do
+        src="${m%%:*}"
+        dst="${m#*:}"
+        dst="${dst%%:*}"
+        [[ "${src}" == /* || "${src}" == .* || "${src}" == "~"* ]] && continue
+        container run --rm -u 0 -v "${src}:/v" --entrypoint sh "${IMAGE}" \
+            -c "find /v -maxdepth 1 ! -user '${VOLUME_OWNER%%:*}' -exec chown '${VOLUME_OWNER}' {} +" \
+            || die "could not chown volume ${src} (for ${dst})"
+    done
+}
+
+graceful_stop() {
+    if is_running; then
+        log "stopping ${NAME} (up to ${STOP_TIMEOUT}s)"
+        container stop -t "${STOP_TIMEOUT}" "${NAME}" >/dev/null 2>&1 || true
+    fi
+}
+
+# --- launchd ---------------------------------------------------------------
+
+# Escape $1 for an XML text node inside a sed `s#...#REPL#` replacement.
+# Sets ESC.
+esc() {
+    ESC="$1"
+    ESC="${ESC//&/&amp;}"
+    ESC="${ESC//</&lt;}"
+    ESC="${ESC//>/&gt;}"
+    ESC="${ESC//\\/\\\\}"
+    ESC="${ESC//&/\\&}"
+    ESC="${ESC//#/\\#}"
+}
+
+render_plist() {
+    [[ -f "${TEMPLATE}" ]] || die "plist template missing: ${TEMPLATE}"
+    # launchd must wait for `container stop` inside serve before SIGKILL.
+    local exit_timeout=$((STOP_TIMEOUT + 15)) subst=() pair
+    for pair in "LABEL=${LABEL}" "SCRIPT=${SCRIPT_PATH}" "CONFIG=${CONFIG}" \
+        "LOG=${LOG}" "EXIT_TIMEOUT=${exit_timeout}" "PATH=${PATH}"; do
+        esc "${pair#*=}"
+        subst+=(-e "s#__${pair%%=*}__#${ESC}#g")
+    done
+    sed "${subst[@]}" "${TEMPLATE}"
+}
+
+write_plist() {
+    mkdir -p "${LA_DIR}" "${LOG_DIR}"
+    render_plist > "${PLIST}"
+    plutil -lint "${PLIST}" >/dev/null
+}
+
+load_agent() {
+    launchctl bootout "${GUI}/${LABEL}" 2>/dev/null || true
+    launchctl bootstrap "${GUI}" "${PLIST}"
+    launchctl enable "${GUI}/${LABEL}"
+}
+
+# --- commands --------------------------------------------------------------
+
+# Foreground run, executed by the launchd agent.
+cmd_serve() {
+    ensure_runtime
+    image_exists || die "image ${IMAGE} missing; run: container-launchd ${CONFIG} build"
+    container rm -f "${NAME}" >/dev/null 2>&1 || true
+    chown_volumes
+
+    # Long-form --memory/--cpus: in podman/docker `-c` means --cpu-shares.
+    local args=(--name "${NAME}" --rm --memory "${MEMORY}" --cpus "${CPUS}") p
+    for p in ${PORTS[@]+"${PORTS[@]}"}; do args+=(--publish "${p}"); done
+    for p in ${MOUNTS[@]+"${MOUNTS[@]}"}; do args+=(--volume "${p}"); done
+    for p in ${ENV[@]+"${ENV[@]}"}; do args+=(--env "${p}"); done
+    if [[ -n "${ENV_FILE}" ]]; then
+        [[ -f "${ENV_FILE}" ]] || die "ENV_FILE not found: ${ENV_FILE}"
+        args+=(--env-file "${ENV_FILE}")
+    fi
+    args+=(${RUN_ARGS[@]+"${RUN_ARGS[@]}"})
+
+    log "starting ${NAME} from ${IMAGE} (${MEMORY}, ${CPUS} CPUs; ports: ${PORTS[*]:-none})"
+    exec container run "${args[@]}" "${IMAGE}" ${CMD[@]+"${CMD[@]}"}
+}
+
+cmd_install() {
+    ensure_runtime
+    image_exists || build_image
+    write_plist
+    load_agent
+    log "installed ${LABEL}; logs: ${LOG}"
+}
+
+cmd_start() {
+    write_plist
+    load_agent
+    log "started ${LABEL}"
+}
+
+cmd_stop() {
+    graceful_stop
+    launchctl bootout "${GUI}/${LABEL}" 2>/dev/null || true
+    log "stopped (agent unloaded until 'container-launchd ${CONFIG} start')"
+}
+
+cmd_restart() {
+    graceful_stop
+    if launchctl print "${GUI}/${LABEL}" >/dev/null 2>&1; then
+        launchctl kickstart -k "${GUI}/${LABEL}"
+    else
+        cmd_start
+    fi
+    log "restarted"
+}
+
+cmd_status() {
+    local agent
+    agent=$(launchctl print "${GUI}/${LABEL}" 2>/dev/null || true)
+    printf 'agent:      %s\n' "${LABEL}"
+    awk -F'= ' '/^\tstate =/ {s=$2} /last exit code =/ {e=$2} END {printf "            %s (last exit %s)\n", s ? s : "not loaded", e ? e : "-"}' <<< "${agent}"
+    printf 'container:  '
+    if is_running; then echo "${NAME} running"; else echo "${NAME} not running"; fi
+    printf 'image:      '
+    if image_exists; then echo "${IMAGE}"; else echo "${IMAGE} (missing)"; fi
+    printf 'ports:      %s\n' "${PORTS[*]:-none}"
+    printf 'log:        %s\n' "${LOG}"
+}
+
+cmd_logs() {
+    [[ -f "${LOG}" ]] || die "no log yet: ${LOG}"
+    if [[ "${1:-}" == "-f" ]]; then
+        tail -f "${LOG}"
+    else
+        tail -n 100 "${LOG}"
+    fi
+}
+
+cmd_uninstall() {
+    graceful_stop
+    launchctl bootout "${GUI}/${LABEL}" 2>/dev/null || true
+    rm -f "${PLIST}"
+    container rm -f "${NAME}" >/dev/null 2>&1 || true
+    if [[ "${1:-}" == "--image" ]]; then
+        container image delete "${IMAGE}" >/dev/null 2>&1 || true
+    fi
+    log "uninstalled ${LABEL} (config kept: ${CONFIG})"
+}
+
+[[ "$#" -ge 2 ]] || usage
+load_config "$1"
+cmd="$2"
+shift 2
+case "${cmd}" in
+    install) cmd_install ;;
+    build) build_image ;;
+    serve) cmd_serve ;;
+    status) cmd_status ;;
+    logs) cmd_logs "$@" ;;
+    restart) cmd_restart ;;
+    stop) cmd_stop ;;
+    start) cmd_start ;;
+    uninstall) cmd_uninstall "$@" ;;
+    plist) render_plist ;;
+    *) usage ;;
+esac
