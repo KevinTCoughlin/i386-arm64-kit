@@ -34,19 +34,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Docker's default seccomp profile (29.x on the amd64 runner) answers
+          # 32-bit socket() with ENOSYS, so native i386 code gets no network.
+          # arm64 is unaffected: qemu-i386 issues 64-bit syscalls.
           - arch: amd64
             runner: ubuntu-latest
+            run_opts: --security-opt seccomp=unconfined
           - arch: arm64
             runner: ubuntu-24.04-arm
+            run_opts: ""
     name: smoke-test (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # The docker-container driver doesn't apply the engine's seccomp profile
+      # to RUN steps, so the SteamCMD bootstrap can reach Steam on amd64.
+      - uses: docker/setup-buildx-action@v4
       - name: Build example image
-        run: docker build --platform linux/${{ matrix.arch }} -t i386-kit-example:test -f examples/Containerfile .
+        run: docker buildx build --load --platform linux/${{ matrix.arch }} -t i386-kit-example:test -f examples/Containerfile .
       - name: Run i386 hello under the image
-        run: docker run --rm i386-kit-example:test
+        run: docker run --rm ${{ matrix.run_opts }} i386-kit-example:test
       - name: SteamCMD starts
         # Like the image build: SteamCMD may exit 1 once right after self-updating.
-        run: docker run --rm i386-kit-example:test bash -c 'steamcmd +quit || steamcmd +quit'
+        run: docker run --rm ${{ matrix.run_opts }} i386-kit-example:test bash -c 'steamcmd +quit || steamcmd +quit'
