@@ -37,6 +37,7 @@
 #               process's /proc/*/comm, pgrep and pidof show NAME, not
 #               "qemu-i386". Use NAME = basename of PATH and health checks
 #               such as `pgrep -x NAME` work on every architecture.
+#               The kernel keeps 15 characters of comm: keep NAME that short.
 #
 # Requires Debian (tested: trixie). Ubuntu arm64 keeps i386 packages on a
 # different mirror than ports.ubuntu.com and needs extra apt sources.
@@ -61,7 +62,7 @@ case "${ARCH}" in
 esac
 
 usage() {
-    sed -n '5,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '5,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 die() {
@@ -88,13 +89,26 @@ write_exec() { # write_exec FILE COMMENT EXEC_LINE
     chmod 0755 "$1"
 }
 
+# Quote $1 as one /bin/sh word (single quotes; safe for spaces, globs, $, ").
+# Sets SQ.
+sh_quote() {
+    local q="'\\''"
+    SQ="'${1//\'/${q}}'"
+}
+
 # Shell fragment (run by /bin/sh at runtime) that starts qemu-i386 with the
 # shim preloaded ahead of any LD_PRELOAD the caller set for the guest.
-# Sets EXEC_LINE.
-qemu_exec() { # qemu_exec QEMU_PATH PROGRAM_EXPR
+# PROGRAM_WORD is spliced in as is: quote it first. Sets EXEC_LINE.
+qemu_exec() { # qemu_exec QEMU_PATH PROGRAM_WORD
+    local qemu preload cpuinfo
+    sh_quote "$1"
+    qemu="${SQ}"
+    sh_quote "LD_PRELOAD=${SHIM}"
+    preload="${SQ}"
+    sh_quote "I386_FAKE_CPUINFO=${FAKE_CPUINFO}"
+    cpuinfo="${SQ}"
     # shellcheck disable=SC2016 # ${LD_PRELOAD} and $@ expand at runtime
-    printf -v EXEC_LINE 'exec %s -E "LD_PRELOAD=%s${LD_PRELOAD:+:${LD_PRELOAD}}" -E I386_FAKE_CPUINFO=%s %s "$@"' \
-        "$1" "${SHIM}" "${FAKE_CPUINFO}" "$2"
+    EXEC_LINE="exec ${qemu} -E ${preload}"'"${LD_PRELOAD:+:${LD_PRELOAD}}"'" -E ${cpuinfo} $2 "'"$@"'
 }
 
 install_fake_cpuinfo() {
@@ -115,20 +129,64 @@ install_fake_cpuinfo() {
         '' > "${FAKE_CPUINFO}"
 }
 
+# True if ELF file $1 is statically linked: no program interpreter and no
+# DT_NEEDED libraries (a static-pie has a dynamic section, but neither).
+# readelf comes with the cross compiler's binutils and reads any ELF.
+is_static() {
+    local headers
+    headers=$(LC_ALL=C i686-linux-gnu-readelf -lW -d "$1" 2> /dev/null) || return 1
+    [[ "${headers}" == *LOAD* && "${headers}" != *INTERP* && "${headers}" != *"(NEEDED)"* ]]
+}
+
+# The image ships a copy of QEMU's qemu-i386 (GPL-2.0), but not the package
+# it came from: keep the package's copyright file and say which source
+# package and version the binary was built from. See README, "License".
+record_qemu_source() { # record_qemu_source QEMU_BINARY_FROM_PACKAGE
+    local pkg="" source="" dir="${FAKE_CPUINFO%/*}"
+    mkdir -p "${dir}"
+    pkg=$(dpkg-query -S "$1" 2> /dev/null | head -n 1) || true
+    pkg="${pkg%%:*}"
+    if [[ -n "${pkg}" ]]; then
+        # shellcheck disable=SC2016 # dpkg-query format, not a shell expansion
+        source=$(dpkg-query -W -f '${source:Package} ${source:Version}' "${pkg}" 2> /dev/null) || true
+        if [[ -f "/usr/share/doc/${pkg}/copyright" ]]; then
+            install -m 0644 "/usr/share/doc/${pkg}/copyright" "${dir}/qemu-i386.copyright"
+        fi
+    fi
+    printf '%s\n' \
+        "${QEMU} is QEMU's i386 user-mode emulator, licensed under the GNU GPL" \
+        "version 2 (copyright and license details: ${dir}/qemu-i386.copyright)." \
+        "It was built by Debian and copied unmodified from the binary package '${pkg:-unknown}'." \
+        "Debian source package and version: ${source:-unknown}" \
+        "Corresponding source: https://snapshot.debian.org/package/${source%% *}/ (that version)," \
+        "or 'apt-get source' of that package and version from a deb-src entry for the same release." \
+        "Upstream: https://www.qemu.org/" > "${dir}/qemu-i386.SOURCE"
+}
+
 install_emulator() {
     [[ -f "${SHIM_SRC}" ]] || die "shim source not found: ${SHIM_SRC} (set I386_SHIM_SRC)"
     # qemu-user ships every target (~460 MB); keep only the ~14 MB static
     # i386 emulator and purge the rest, along with the cross compiler.
     local build_deps=(qemu-user gcc-i686-linux-gnu libc6-dev-i386-cross)
     apt-get install -y --no-install-recommends "${build_deps[@]}"
-    local src
+    # Only a static qemu-i386 survives the purge below: a dynamically linked
+    # one (qemu-user before Debian trixie) loses its libraries with it.
+    local src found="" dynamic=()
     for src in /usr/bin/qemu-i386 /usr/bin/qemu-i386-static; do
-        if [[ -x "${src}" ]]; then
-            install -m 0755 "${src}" "${QEMU}"
+        [[ -x "${src}" ]] || continue
+        # shellcheck disable=SC2310 # predicate
+        if is_static "${src}"; then
+            found="${src}"
             break
         fi
+        dynamic+=("${src}")
     done
-    [[ -x "${QEMU}" ]] || die "qemu-user did not provide qemu-i386"
+    if [[ -z "${found}" ]]; then
+        [[ "${#dynamic[@]}" -gt 0 ]] || die "qemu-user did not provide qemu-i386"
+        die "${dynamic[*]} is not statically linked (or could not be read with readelf), so it would stop working once qemu-user is purged. This kit needs a static qemu-i386: use a Debian trixie (or newer) base, whose qemu-user is static."
+    fi
+    install -m 0755 "${found}" "${QEMU}"
+    record_qemu_source "${found}"
     i686-linux-gnu-gcc -O2 -shared -fPIC -Wall -Wextra -Werror \
         -o "${SHIM}" "${SHIM_SRC}" -ldl
     apt-get purge -y --auto-remove "${build_deps[@]}"
@@ -151,7 +209,7 @@ case "${prog}" in
     */*) ;;
     *) prog=$(command -v "${prog}") || { echo "run-i386: ${prog}: not found" >&2; exit 127; } ;;
 esac'
-    # shellcheck disable=SC2016
+    # shellcheck disable=SC2016 # expanded by /bin/sh at runtime
     qemu_exec "${QEMU}" '"${prog}"'
     write_exec "${BIN_DIR}/run-i386" "run an i386 program under qemu-i386." \
         "${lookup}
@@ -162,12 +220,19 @@ install_launcher() { # install_launcher NAME=PATH
     local name="${1%%=*}" target="${1#*=}"
     [[ "$1" == *=* && -n "${name}" && "${name}" != */* ]] || die "--launcher wants NAME=/path/to/binary, got '$1'"
     [[ "${target}" == /* ]] || die "--launcher ${name}: path must be absolute, got '${target}'"
+    [[ "$1" != *$'\n'* ]] || die "--launcher ${name}: newlines are not allowed"
+    # /proc/PID/comm is at most 15 characters (TASK_COMM_LEN - 1): a longer
+    # NAME is cut there, and `pgrep -x NAME` / `pidof NAME` no longer match.
+    if [[ "${#name}" -gt 15 ]]; then
+        echo "i386-compat.sh: warning: launcher name '${name}' is longer than 15 characters; its comm will be '${name:0:15}' (use that with pgrep -x, or pgrep -f)" >&2
+    fi
+    sh_quote "${target}"
     if [[ "${EMULATE}" == "0" ]]; then
-        write_exec "${BIN_DIR}/${name}" "run ${target} (native i386)." "exec ${target} \"\$@\""
+        write_exec "${BIN_DIR}/${name}" "run ${target} (native i386)." "exec ${SQ} \"\$@\""
     else
         mkdir -p "${KIT_DIR}/emu"
         ln -sf "${QEMU}" "${KIT_DIR}/emu/${name}"
-        qemu_exec "${KIT_DIR}/emu/${name}" "${target}"
+        qemu_exec "${KIT_DIR}/emu/${name}" "${SQ}"
         write_exec "${BIN_DIR}/${name}" "run ${target} under qemu-i386 (comm: ${name})." "${EXEC_LINE}"
     fi
     echo "launcher: ${BIN_DIR}/${name} -> ${target}"
