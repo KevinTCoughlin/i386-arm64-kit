@@ -24,6 +24,9 @@
 # The agent has KeepAlive { SuccessfulExit = false }: launchd restarts
 # `serve` only on a non-zero exit (crash, killed VM), so a graceful stop
 # (`container stop`, exit 0) stays stopped.
+#
+# Its log (LOG_DIR/NAME.log) is checked each time `serve` starts: once past
+# LOG_MAX_MB (default 10, 0 = never) it is copied to NAME.log.1 and emptied.
 # Predicates (is_running, image_exists) are meant to be used in conditions.
 # shellcheck disable=SC2310
 set -euo pipefail
@@ -49,7 +52,7 @@ die() {
     exit 1
 }
 usage() {
-    sed -n '5,27p' "${SCRIPT_PATH}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '5,29p' "${SCRIPT_PATH}" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -85,6 +88,7 @@ load_config() {
     PLATFORM="linux/arm64"
     LABEL=""
     LOG_DIR="${HOME}/Library/Logs/container-launchd"
+    LOG_MAX_MB=10
 
     # shellcheck source=example.conf
     source "${CONFIG}"
@@ -93,6 +97,10 @@ load_config() {
     [[ -n "${IMAGE}" ]] || die "${CONFIG}: IMAGE is required"
     [[ "${NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "${CONFIG}: invalid NAME '${NAME}'"
     [[ "${STOP_TIMEOUT}" =~ ^[0-9]+$ ]] || die "${CONFIG}: STOP_TIMEOUT must be seconds"
+    [[ "${LOG_MAX_MB}" =~ ^[0-9]+$ ]] || die "${CONFIG}: LOG_MAX_MB must be a whole number of MiB (0 = never rotate)"
+    # Spliced into an `sh -c` command line inside the container (chown_volumes).
+    [[ -z "${VOLUME_OWNER}" || "${VOLUME_OWNER}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)?$ ]] ||
+        die "${CONFIG}: VOLUME_OWNER must be uid[:gid] or user[:group], got '${VOLUME_OWNER}'"
     LABEL="${LABEL:-local.container-launchd.${NAME}}"
     LOG="${LOG_DIR}/${NAME}.log"
     PLIST="${LA_DIR}/${LABEL}.plist"
@@ -183,10 +191,31 @@ load_agent() {
     launchctl enable "${GUI}/${LABEL}"
 }
 
+# launchd appends everything `serve` and the container print to LOG and never
+# trims it. Each time serve starts, a log over LOG_MAX_MB is copied to LOG.1
+# (replacing the previous one) and emptied, so at most about twice that is
+# kept, plus whatever one uninterrupted run writes. Copy-and-truncate rather
+# than rename because launchd (and a running `logs -f`) holds the file open.
+rotate_log() {
+    [[ "${LOG_MAX_MB}" -gt 0 && -f "${LOG}" ]] || return 0
+    local size
+    size=$(wc -c < "${LOG}") || return 0
+    size="${size//[^0-9]/}"
+    [[ "${size:-0}" -gt $((LOG_MAX_MB * 1024 * 1024)) ]] || return 0
+    cp -f "${LOG}" "${LOG}.1" || echo "container-launchd: could not save ${LOG}.1; emptying ${LOG} anyway" >&2
+    : > "${LOG}"
+    # Where our own output is that file, reopen it in append mode so writes
+    # land at the new end whatever mode the descriptor was opened in.
+    if [[ /dev/stdout -ef "${LOG}" ]]; then exec >> "${LOG}"; fi
+    if [[ /dev/stderr -ef "${LOG}" ]]; then exec 2>> "${LOG}"; fi
+    log "rotated ${LOG} (was ${size} bytes, limit ${LOG_MAX_MB} MiB); previous log: ${LOG}.1"
+}
+
 # --- commands --------------------------------------------------------------
 
 # Foreground run, executed by the launchd agent.
 cmd_serve() {
+    rotate_log
     ensure_runtime
     image_exists || die "image ${IMAGE} missing; run: container-launchd ${CONFIG} build"
     container rm -f "${NAME}" >/dev/null 2>&1 || true

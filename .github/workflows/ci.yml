@@ -17,12 +17,12 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
         run: |
           shellcheck --enable=all -x -P SCRIPTDIR image/i386-compat.sh image/install-steamcmd.sh \
-            probe.sh macos/container-launchd macos/example.conf
-      - uses: hadolint/hadolint-action@v3.5.0
+            probe.sh macos/container-launchd macos/example.conf tests/launcher-comm.sh
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with:
           dockerfile: examples/Containerfile
 
@@ -47,14 +47,23 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The docker-container driver doesn't apply the engine's seccomp profile
       # to RUN steps, so the SteamCMD bootstrap can reach Steam on amd64.
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build example image
         run: docker buildx build --load --platform linux/${{ matrix.arch }} -t i386-kit-example:test -f examples/Containerfile .
       - name: Run i386 hello under the image
         run: docker run --rm ${{ matrix.run_opts }} i386-kit-example:test
+      - name: Launcher process is named after the launcher (comm, pgrep -x, pidof)
+        run: docker run --rm -i ${{ matrix.run_opts }} i386-kit-example:test bash -s < tests/launcher-comm.sh
+      - name: Native child of an i386 process doesn't inherit the shim
+        # Without that, ld.so in every native child prints "... cannot be
+        # preloaded (wrong ELF class: ELFCLASS32)" on arm64.
+        run: |
+          docker run --rm ${{ matrix.run_opts }} i386-kit-example:test hello-i386 --exec /bin/sh -c 'echo "child LD_PRELOAD=[${LD_PRELOAD:-}]"' 2>&1 | tee exec.log
+          grep -qxF 'child LD_PRELOAD=[]' exec.log
+          if grep -E 'cannot be preloaded|wrong ELF class' exec.log; then exit 1; fi
       - name: SteamCMD starts
         # Like the image build: SteamCMD may exit 1 once right after self-updating.
         run: docker run --rm ${{ matrix.run_opts }} i386-kit-example:test bash -c 'steamcmd +quit || steamcmd +quit'

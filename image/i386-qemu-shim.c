@@ -20,6 +20,13 @@
  *  2. /proc/cpuinfo. Under qemu-user it still describes the host ARM CPU and
  *     SteamCMD exits(1) when it finds no x86 "flags" line. Opens of
  *     /proc/cpuinfo are redirected to $I386_FAKE_CPUINFO when that is set.
+ *
+ * Once loaded it removes itself from LD_PRELOAD, so the native (arm64)
+ * programs the i386 process starts (/bin/sh, curl, ...) don't inherit a
+ * 32-bit x86 preload and make ld.so print "wrong ELF class: ELFCLASS32" on
+ * every exec. i386 children started through run-i386 or a launcher get it
+ * again from there. Set I386_SHIM_INHERIT=1 to leave LD_PRELOAD alone (for
+ * setups where a binfmt_misc handler runs i386 children directly).
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -57,6 +64,49 @@ static __thread size_t registered_len;
 
 #define REAL(name) static __typeof__(name) *real_##name; \
     if (real_##name == NULL) real_##name = (__typeof__(name) *)dlsym(RTLD_NEXT, #name)
+
+__attribute__((constructor)) static void drop_from_preload(void)
+{
+    const char *cur = getenv("LD_PRELOAD");
+    const char *inherit = getenv("I386_SHIM_INHERIT");
+    const char *p;
+    char *out, *o;
+    size_t self_len;
+    Dl_info self;
+
+    if (cur == NULL)
+        return;
+    if (inherit != NULL && *inherit != '\0' && strcmp(inherit, "0") != 0)
+        return;
+    /* dli_fname is this library's name as ld.so loaded it, i.e. exactly its
+     * LD_PRELOAD entry. Other entries (the caller's) are kept. */
+    if (dladdr((void *)drop_from_preload, &self) == 0 || self.dli_fname == NULL)
+        return;
+    self_len = strlen(self.dli_fname);
+    out = malloc(strlen(cur) + 1);
+    if (out == NULL)
+        return;
+    o = out;
+    for (p = cur; *p != '\0';) {
+        size_t n = strcspn(p, ": "); /* ld.so splits on both */
+
+        if (n > 0 && !(n == self_len && strncmp(p, self.dli_fname, n) == 0)) {
+            if (o != out)
+                *o++ = ':';
+            memcpy(o, p, n);
+            o += n;
+        }
+        p += n;
+        if (*p != '\0')
+            p++;
+    }
+    *o = '\0';
+    if (o == out)
+        unsetenv("LD_PRELOAD");
+    else
+        setenv("LD_PRELOAD", out, 1);
+    free(out);
+}
 
 long syscall(long number, ...)
 {
@@ -110,9 +160,18 @@ static const char *redirect(const char *path)
     return (fake != NULL && *fake != '\0') ? fake : path;
 }
 
+/* open() takes a mode only with O_CREAT or O_TMPFILE. O_TMPFILE is two bits,
+ * __O_TMPFILE | O_DIRECTORY (i386: 020000000 | 0200000), so it has to be
+ * compared whole: `flags & O_TMPFILE` is also true for a plain O_DIRECTORY
+ * open, which passes no mode to read. */
+_Static_assert((O_TMPFILE & O_DIRECTORY) == O_DIRECTORY && O_TMPFILE != O_DIRECTORY,
+               "O_TMPFILE is expected to include O_DIRECTORY");
+
 static mode_t mode_arg(int flags, va_list ap)
 {
-    return (flags & (O_CREAT | O_TMPFILE)) ? (mode_t)va_arg(ap, int) : 0;
+    if ((flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE)
+        return (mode_t)va_arg(ap, int);
+    return 0;
 }
 
 int open(const char *path, int flags, ...)

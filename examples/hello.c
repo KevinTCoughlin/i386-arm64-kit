@@ -2,7 +2,8 @@
  * Smoke test: a dynamically linked i386 program that checks the two things
  * the shim fakes, so a passing run proves libc6:i386, qemu-i386 and the shim
  * are all wired up. `hello-i386 --sleep N` then stays up N seconds, to check
- * what /proc/PID/comm shows for a launcher.
+ * what /proc/PID/comm shows for a launcher. `hello-i386 --exec PROG [ARGS]`
+ * then execs PROG (a native program, say), to check what a child inherits.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -42,5 +43,13 @@ int main(int argc, char **argv)
         fflush(stdout);
         sleep((unsigned int)atoi(argv[2]));
     }
-    return (len > 0 && x86_flags) ? 0 : 1;
+    if (len == 0 || !x86_flags)
+        return 1;
+    if (argc >= 3 && strcmp(argv[1], "--exec") == 0) {
+        fflush(stdout);
+        execvp(argv[2], argv + 2);
+        perror(argv[2]);
+        return 127;
+    }
+    return 0;
 }
