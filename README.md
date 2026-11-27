@@ -35,7 +35,8 @@ image: localhost/cs-server:latest (linux/arm64)
 
 `probe.sh` mounts a static arm64 busybox into the image and runs that, so it
 also works on shell-less and amd64-only images. It fetches the busybox once
-via `alpine:3.24` into `~/Library/Caches/i386-arm64-kit`.
+via `alpine:3.24` into `~/Library/Caches/i386-arm64-kit` (under
+`$XDG_CACHE_HOME` instead, if that is set).
 
 ## Quick start
 
@@ -49,12 +50,14 @@ RUN --mount=type=bind,source=image,target=/usr/local/src/i386-kit \
     bash /usr/local/src/i386-kit/i386-compat.sh install \
         --i386-pkg libcurl4t64 \
         --launcher srcds_linux=/srv/game/srcds_linux \
-        curl
+        curl procps
 # Build-time i386 tools:
 RUN run-i386 ./amxxpc plugin.sma
 CMD ["srcds_linux", "-game", "..."]
 HEALTHCHECK CMD pgrep -x srcds_linux
 ```
+
+(`procps` is there for the health check's `pgrep`; `debian:*-slim` has none.)
 
 ```bash
 container build --platform linux/arm64 -t my-server .
@@ -91,7 +94,11 @@ i386-compat.sh emulated     # exit 0 if this arch runs i386 under qemu
   `qemu-user`, which bundles every target at ~460 MB; the static i386
   emulator alone is 14 MB, and the package is purged again),
   `/usr/local/lib/i386-qemu-shim.so` (built with a cross compiler that is also
-  purged) and a fake x86 `/proc/cpuinfo`;
+  purged) and a fake x86 `/proc/cpuinfo`. Before the purge it checks that
+  `qemu-i386` really is statically linked and stops the build if not (a
+  dynamic one, as in `qemu-user` before trixie, would lose its libraries).
+  QEMU's copyright file and a note of the Debian source version are kept in
+  `/usr/local/share/i386-kit/` (see [License](#license));
 - `/usr/local/bin/run-i386` and one `/usr/local/bin/NAME` per `--launcher`.
 
 It then removes `/var/lib/apt/lists` unless `--keep-apt-lists`.
@@ -113,9 +120,20 @@ that symlink, so `/proc/PID/comm`, `pgrep -x NAME`, `pidof` and existing
 health checks see `NAME` instead of `qemu-i386`. Pick `NAME` = the binary's
 basename and they behave the same on every architecture. The binary doesn't
 need to exist when the launcher is created (SteamCMD can fetch it later).
+Keep `NAME` to 15 characters: that is all the kernel stores in `comm`, so a
+longer name is cut off and `pgrep -x NAME` stops matching (`install` warns).
+`tests/launcher-comm.sh` checks all of this in the example image, and CI runs
+it on both architectures.
 
 Both preload the shim ahead of any `LD_PRELOAD` you set for the guest, and
-pass `I386_FAKE_CPUINFO`.
+pass `I386_FAKE_CPUINFO`. The shim takes itself out of `LD_PRELOAD` once it
+is loaded, so native (arm64) programs the i386 process starts don't inherit
+an i386 preload and make `ld.so` complain about `wrong ELF class: ELFCLASS32`.
+An i386 child has to go through `run-i386` or a launcher anyway, and gets the
+shim again there. `I386_SHIM_INHERIT=1` turns that off.
+
+The generated wrappers single-quote their paths, so a launcher target or
+SteamCMD directory with spaces works.
 
 ## `image/i386-qemu-shim.c`: why it exists
 
@@ -164,8 +182,8 @@ DEBUGGER=run-i386 STEAM_PLATFORM=linux32 /opt/steamcmd/steamcmd.sh +login anonym
 **SteamCMD itself is always a 32-bit x86 binary**, even when the server it
 downloads is 64-bit. So this helps any SteamCMD-installed server on arm64,
 not only 32-bit ones: in a `linux/amd64` image under Rosetta, SteamCMD
-can't run at all. The first `steamcmd +quit` self-updates (~40 MB) and may
-exit 1 right after updating; run it at build time (`install-steamcmd.sh
+can't run at all. The first `steamcmd +quit` self-updates (a ~40 MB
+download, about 200 MB unpacked) and may exit 1 right after updating; run it at build time (`install-steamcmd.sh
 --bootstrap`, or as in the example) so containers don't redo it.
 
 For a 64-bit x86 server, the kit gets SteamCMD working in an arm64 image;
@@ -208,14 +226,19 @@ container-launchd CONFIG install | build | status | logs [-f] | restart
 `CONFIG` is a file path or `NAME` for `~/.config/container-launchd/NAME.conf`.
 The config is bash: `NAME`, `IMAGE` (required), `PORTS=()`, `MOUNTS=()`,
 `ENV=()`, `ENV_FILE`, `MEMORY`, `CPUS`, `STOP_TIMEOUT`, `RUN_ARGS=()`,
-`CMD=()`, `VOLUME_OWNER`, and optionally `BUILD_CONTEXT`/`CONTAINERFILE`/
-`PLATFORM` to build the image when it's missing. See
+`CMD=()`, `VOLUME_OWNER`, `LABEL`, `LOG_DIR`, `LOG_MAX_MB`, and optionally
+`BUILD_CONTEXT`/`CONTAINERFILE`/`PLATFORM` to build the image when it's
+missing. See
 [`macos/example.conf`](macos/example.conf).
 
 - The agent (`local.container-launchd.NAME`, from
   [`container-launchd.plist.in`](macos/container-launchd.plist.in)) runs
   `container-launchd CONFIG serve`, which `exec`s `container run --rm`
-  in the foreground. Logs go to `~/Library/Logs/container-launchd/NAME.log`.
+  in the foreground. Logs go to `~/Library/Logs/container-launchd/NAME.log`
+  (`LOG_DIR`).
+- launchd never trims that file. Each time the service starts, a log over
+  `LOG_MAX_MB` (default 10; 0 = never) is copied to `NAME.log.1` and emptied.
+  A service that runs for months without a restart isn't trimmed in between.
 - `KeepAlive { SuccessfulExit = false }`: launchd restarts it after a crash
   or killed VM but not after a graceful stop. `stop` runs
   `container stop -t STOP_TIMEOUT` and unloads the agent; `ExitTimeOut` is
@@ -237,6 +260,7 @@ macos/container-launchd     launchd wrapper for one Apple container service
 macos/container-launchd.plist.in, macos/example.conf
 probe.sh                    which binaries need what
 examples/Containerfile      SteamCMD image + i386 smoke test (examples/hello.c)
+tests/launcher-comm.sh      comm / pgrep -x / pidof check for a launcher (CI)
 justfile                    lint / test recipes
 ```
 
@@ -264,7 +288,14 @@ trixie (qemu 10.0):
 - `container-launchd serve` (ports, env, named volume + `VOLUME_OWNER`) and
   plist rendering (`plutil -lint`, paths with `&#<>`) under bash 3.2 and 5.
 
+- CI builds the example on `ubuntu-24.04-arm` as well (qemu-i386 path) and
+  runs the smoke test, `tests/launcher-comm.sh`, a native child started from
+  the i386 process (no `LD_PRELOAD` inherited) and SteamCMD.
+
 Not verified:
+
+- log rotation (`LOG_MAX_MB`) under a live launchd: tested with `serve` run
+  by hand on Linux and its output appended to the log file;
 
 - `container-launchd install`/`stop`/`restart`/`uninstall` against a live
   launchd (the same flow as cs-server's `ops/cs-server`, which is in use);
@@ -273,4 +304,27 @@ Not verified:
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+The kit (scripts, shim, examples) is MIT. See [LICENSE](LICENSE).
+
+**Images built with it for arm64 also contain QEMU.** On non-x86,
+`i386-compat.sh` copies Debian's `qemu-i386` binary to
+`/usr/local/bin/qemu-i386`, and QEMU is licensed under the GNU GPL version 2
+(the static binary also carries the libraries it links, such as LGPL glib).
+Building and running such an image for yourself asks nothing of you. If you
+**distribute** it (push it to a public registry, hand it to someone), you are
+distributing a GPLv2 binary and have to meet GPLv2 section 3: pass on the
+license and make the corresponding source available (ship it alongside, or
+give a written offer for it). To make that practical, the image keeps:
+
+- `/usr/local/share/i386-kit/qemu-i386.copyright`: Debian's copyright file
+  for the package, with the license terms;
+- `/usr/local/share/i386-kit/qemu-i386.SOURCE`: the Debian source package
+  and exact version the binary came from, and where to fetch it
+  (<https://snapshot.debian.org/package/qemu/>, or `apt-get source`).
+
+The binary is unmodified, so that Debian source package is the corresponding
+source; a pointer to someone else's download is not by itself a written
+offer, so mirror the source (or publish your own offer) if you distribute
+images for real. The shim is a separate MIT work: it is loaded into the i386
+guest process, not linked into QEMU. amd64 images contain no QEMU. This is a
+summary, not legal advice.
